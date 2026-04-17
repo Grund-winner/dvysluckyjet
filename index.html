@@ -285,6 +285,20 @@ function recordPrediction(predicted, confidence, category) {
   saveMemory(mem);
 }
 
+/* Compte les predictions consecutives de la meme categorie */
+function getConsecutive() {
+  var mem = loadMemory();
+  var preds = mem.predictions;
+  if (!preds.length) return { cat: null, count: 0 };
+  var last = preds[preds.length - 1].category;
+  var count = 1;
+  for (var i = preds.length - 2; i >= 0; i--) {
+    if (preds[i].category === last) count++;
+    else break;
+  }
+  return { cat: last, count: count };
+}
+
 function validateLastPrediction(actual) {
   var mem = loadMemory();
   var preds = mem.predictions;
@@ -384,384 +398,249 @@ function extractCoefs(data) {
 }
 
 /* ================================================================
-   DVYS PREDICTOR V3 - Moteur intelligent adaptatif avec memoire
-   8 modules ponderes, systeme de vote, base sur la moyenne
+   DVYS PREDICTOR V4 - Tendances intelligentes avec rotation
+   - Detecte la tendance reelle du jeu (basse/moyenne/haute)
+   - Limite les predictions consecutives: low max 3, mid max 3, high max 2
+   - 3eme low = transition vers mid (>2x)
+   - 2eme high = retour automatique mid ou low
+   - Base sur la moyenne historique pour les valeurs
    ================================================================ */
 var DVYSPredictor = (function() {
 
-  /* --- Helpers --- */
   function avg(a){if(!a.length)return 0;var s=0;for(var i=0;i<a.length;i++)s+=a[i];return s/a.length}
   function sd(a){if(a.length<2)return 0;var m=avg(a),s=0;for(var i=0;i<a.length;i++)s+=Math.pow(a[i]-m,2);return Math.sqrt(s/(a.length-1))}
-  function ema(a,p){if(!a.length)return 0;var k=2/(p+1),e=a[0];for(var i=1;i<a.length;i++)e=a[i]*k+e*(1-k);return e}
-  function cat(v){return v<2?'low':v<10?'mid':'high'}
   function rr(a,b){return a+Math.random()*(b-a)}
   function cl(v,l,h){return Math.max(l,Math.min(h,v))}
-  function median(a){var s=a.slice().sort(function(x,y){return x-y});var m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2}
+  function cat(v){return v<2?'low':v<10?'mid':'high'}
 
-  /* === MODULE 1: Tendance EMA === */
-  function trendModule(rev) {
-    var n = rev.length;
-    var e5 = ema(rev, 5);
-    var e10 = n >= 10 ? ema(rev, 10) : e5;
-    var macd = e5 - e10;
-    var dir = 0, str = 0;
-    if (macd > 0.15) { dir = 1; str = Math.min(macd / 1.5, 1); }
-    else if (macd < -0.15) { dir = -1; str = Math.min(Math.abs(macd) / 1.5, 1); }
-    return { dir: dir, strength: str, ema5: e5, ema10: e10, macd: macd };
-  }
+  /* === Detection de la tendance du jeu === */
+  function detectTrend(history) {
+    var n = history.length;
+    if (n < 5) return { trend: 'mid', strength: 0.5 };
 
-  /* === MODULE 2: Series / Streak === */
-  function streakModule(rev) {
-    var c = rev.map(cat);
-    var last = c[0], len = 1;
-    for (var i = 1; i < c.length; i++) {
-      if (c[i] === last) len++;
+    var recent = history.slice(-10);
+    var recent8 = n >= 8 ? history.slice(-8) : recent;
+    var recent5 = n >= 5 ? history.slice(-5) : recent;
+
+    var avg5 = avg(recent5);
+    var avg8 = avg(recent8);
+    var avg10 = avg(recent);
+
+    /* Compter la distribution recente */
+    var lowC = 0, midC = 0, highC = 0;
+    for (var i = 0; i < recent.length; i++) {
+      if (recent[i] < 2) lowC++;
+      else if (recent[i] < 10) midC++;
+      else highC++;
+    }
+
+    var total = recent.length;
+    var lowPct = lowC / total;
+    var midPct = midC / total;
+    var highPct = highC / total;
+
+    /* Detection des series */
+    var streak = cat(recent[recent.length - 1]);
+    var streakLen = 1;
+    for (var j = recent.length - 2; j >= 0; j--) {
+      if (cat(recent[j]) === streak) streakLen++;
       else break;
     }
-    return { cat: last, len: len };
+
+    /* --- Regles de detection --- */
+    /* Basse: majorite de crashs < 2x ou moyenne recente basse */
+    if (lowPct >= 0.55 || (avg5 < 1.8 && avg8 < 2.2)) {
+      return { trend: 'low', strength: Math.min(lowPct / 0.7, 1), streak: streak, streakLen: streakLen };
+    }
+    /* Haute: majorite de crashs >= 10x ou moyenne recente elevee + serie haute */
+    if (highPct >= 0.4 || (avg5 > 6 && streak === 'high' && streakLen >= 2)) {
+      return { trend: 'high', strength: Math.min(highPct / 0.5, 1), streak: streak, streakLen: streakLen };
+    }
+    /* Moyenne: le reste du temps - la categorie la plus naturelle */
+    if (midPct >= 0.4 || (avg5 >= 2 && avg5 <= 8)) {
+      return { trend: 'mid', strength: Math.min(midPct / 0.6, 1), streak: streak, streakLen: streakLen };
+    }
+    /* Defaut: neutre → mid */
+    return { trend: 'mid', strength: 0.4, streak: streak, streakLen: streakLen };
   }
 
-  /* === MODULE 3: Markov (chaines de transition) === */
-  function markovModule(rev) {
-    var c = rev.map(cat), n = c.length;
-    if (n < 8) return { low: 0.34, mid: 0.33, high: 0.33, top: 'mid', prob: 0.34 };
-    var tr = { low:{low:0,mid:0,high:0}, mid:{low:0,mid:0,high:0}, high:{low:0,mid:0,high:0} };
-    for (var i = 0; i < n - 1; i++) tr[c[i]][c[i+1]]++;
-    for (var f in tr) {
-      var t = tr[f].low + tr[f].mid + tr[f].high + 3;
-      tr[f].low = (tr[f].low + 1) / t;
-      tr[f].mid = (tr[f].mid + 1) / t;
-      tr[f].high = (tr[f].high + 1) / t;
+  /* === Generation de la valeur === */
+  function generateValue(chosenCat, history, forceTransition) {
+    var n = history.length;
+    var allAvg = avg(history);
+    var recent5 = n >= 5 ? avg(history.slice(-5)) : allAvg;
+
+    /* Moyennes par categorie depuis l'historique */
+    var lows = [], mids = [], highs = [];
+    for (var i = 0; i < n; i++) {
+      if (history[i] < 2) lows.push(history[i]);
+      else if (history[i] < 10) mids.push(history[i]);
+      else highs.push(history[i]);
     }
-    var p = tr[c[0]], top = null, tP = 0;
-    for (var k in p) { if (p[k] > tP) { tP = p[k]; top = k; } }
-    return { low: p.low, mid: p.mid, high: p.high, top: top, prob: tP };
-  }
+    var avgLow = lows.length ? avg(lows) : 1.35;
+    var avgMid = mids.length ? avg(mids) : 3.5;
+    var avgHigh = highs.length ? avg(highs) : 15;
 
-  /* === MODULE 4: Pattern Matching (utilise TOUT l'historique stocke) === */
-  function patternModule(rev, fullHistory) {
-    if (fullHistory.length < 12) return null;
-    var c = fullHistory.map(cat);
-    var best = null, bestScore = 0;
-
-    for (var len = 2; len <= 4; len++) {
-      if (rev.length < len) continue;
-      /* Pattern = derniers 'len' resultats en ordre chronologique */
-      var pat = [];
-      for (var j = len - 1; j >= 0; j--) pat.push(cat(rev[j]));
-
-      var matches = 0;
-      var next = { low: 0, mid: 0, high: 0 };
-
-      for (var i = 0; i <= c.length - len - 1; i++) {
-        var eq = true;
-        for (var k = 0; k < len; k++) {
-          if (c[i + k] !== pat[k]) { eq = false; break; }
-        }
-        if (eq) {
-          matches++;
-          next[c[i + len]]++;
-        }
-      }
-
-      if (matches >= 2) {
-        var total = next.low + next.mid + next.high;
-        if (total > 0) {
-          var bCat = null, bV = 0;
-          for (var kk in next) { if (next[kk] > bV) { bV = next[kk]; bCat = kk; } }
-          var prob = bV / total;
-          var score = prob * Math.min(matches, 15) * len * 0.08;
-          if (score > bestScore) {
-            bestScore = score;
-            best = { cat: bCat, prob: prob, matches: matches, pattern: len + '-gram' };
-          }
-        }
-      }
-    }
-    return best;
-  }
-
-  /* === MODULE 5: Cycles (repetition periodique sur tout l'historique) === */
-  function cycleModule(fullHistory) {
-    var c = fullHistory.map(cat);
-    var n = c.length;
-    if (n < 20) return { found: false };
-    var bL = 0, bS = 0;
-    for (var p = 3; p <= Math.min(15, Math.floor(n / 3)); p++) {
-      var m = 0, t = 0;
-      for (var i = p; i < n; i++) { t++; if (c[i] === c[i - p]) m++; }
-      var sc = t > 0 ? m / t : 0;
-      if (sc > bS && sc > 0.35) { bS = sc; bL = p; }
-    }
-    if (bL > 0) return { found: true, period: bL, score: bS };
-    return { found: false };
-  }
-
-  /* === MODULE 6: Mean Reversion === */
-  function meanRevModule(rev) {
-    var n = rev.length;
-    var s5 = avg(rev.slice(0, Math.min(5, n)));
-    var s10 = n >= 10 ? avg(rev.slice(0, 10)) : s5;
-    var s20 = n >= 20 ? avg(rev.slice(0, 20)) : s10;
-    var last = rev[0];
-    var dev = (last - s5) / Math.max(s5, 0.01);
-    return { deviation: dev, shortAvg: s5, midAvg: s10, longAvg: s20, last: last };
-  }
-
-  /* === MODULE 7: Momentum === */
-  function momentumModule(rev) {
-    if (rev.length < 5) return { dir: 'neutral', strength: 0 };
-    var ch = [];
-    for (var i = 1; i < rev.length; i++) ch.push(rev[i] - rev[i-1]);
-    var r3 = 0, c = Math.min(3, ch.length);
-    for (var i = ch.length - c; i < ch.length; i++) r3 += ch[i];
-    r3 /= c;
-    var dir = 'neutral', str = 0;
-    if (r3 > 0.25) { dir = 'up'; str = Math.min(r3 / 2, 1); }
-    else if (r3 < -0.25) { dir = 'down'; str = Math.min(Math.abs(r3) / 2, 1); }
-    return { dir: dir, strength: str, rate: r3 };
-  }
-
-  /* === MODULE 8: Volatilite === */
-  function volModule(rev) {
-    var n = rev.length;
-    var window = rev.slice(0, Math.min(12, n));
-    return sd(window);
-  }
-
-  /* ================================================================
-     PREDICTION PRINCIPALE - Systeme de vote pondere
-     ================================================================ */
-  function predict(fullHistory) {
-    if (fullHistory.length < 3) {
-      return {
-        prediction: cl(avg(fullHistory) + rr(-.2, .2), 1.01, 25),
-        confidence: 20,
-        signals: ['donnees_insuffisantes'],
-        category: 'mid',
-        rounds: fullHistory.length
-      };
-    }
-
-    var rev = fullHistory.slice().reverse();
-    var n = fullHistory.length;
-
-    /* === Statistiques cles === */
-    var longAvg = avg(fullHistory);
-    var longMed = median(fullHistory);
-    var recent5 = avg(rev.slice(0, Math.min(5, n)));
-    var recent10 = avg(rev.slice(0, Math.min(10, n)));
-    var recent20 = avg(rev.slice(0, Math.min(20, n)));
-
-    /* === Executer tous les modules === */
-    var td = trendModule(rev);
-    var sk = streakModule(rev);
-    var mk = markovModule(rev);
-    var pm = patternModule(rev, fullHistory);
-    var cy = cycleModule(fullHistory);
-    var mr = meanRevModule(rev);
-    var mo = momentumModule(rev);
-    var vl = volModule(rev);
-
-    /* === SYSTEME DE VOTE === */
-    var votes = { low: 0, mid: 0, high: 0 };
-    var signals = [];
-
-    /* Prior bayesien base sur la distribution historique */
-    if (n >= 20) {
-      var pLow = 0, pMid = 0, pHigh = 0;
-      for (var i = 0; i < n; i++) {
-        if (fullHistory[i] < 2) pLow++;
-        else if (fullHistory[i] < 10) pMid++;
-        else pHigh++;
-      }
-      var tot = pLow + pMid + pHigh;
-      votes.low += (pLow / tot) * 1.5;
-      votes.mid += (pMid / tot) * 1.5;
-      votes.high += (pHigh / tot) * 1.5;
-    }
-
-    /* MODULE 1: Tendance (poids 2.5) */
-    if (td.dir > 0) {
-      votes.mid += 1.5 * (1 - td.strength);
-      votes.high += 1.0 * td.strength;
-      signals.push({ text: 'tendance_haussiere', type: 'up' });
-    } else if (td.dir < 0) {
-      votes.low += 1.5 * (1 - td.strength);
-      votes.mid += 1.0 * td.strength;
-      signals.push({ text: 'tendance_baissiere', type: 'down' });
-    } else {
-      votes.low += 0.3; votes.mid += 1.2; votes.high += 0.3;
-      signals.push({ text: 'tendance_neutre', type: 'info' });
-    }
-
-    /* MODULE 2: Markov (poids 2.0) */
-    votes.low += mk.low * 2.0;
-    votes.mid += mk.mid * 2.0;
-    votes.high += mk.high * 2.0;
-    if (mk.prob > 0.45) {
-      var mType = mk.top === 'low' ? 'down' : mk.top === 'high' ? 'up' : 'info';
-      signals.push({ text: 'markov_' + mk.top, type: mType });
-    }
-
-    /* MODULE 3: Pattern Matching (poids 2.0) */
-    if (pm) {
-      votes[pm.cat] += pm.prob * 2.0;
-      var pType = pm.cat === 'low' ? 'down' : pm.cat === 'high' ? 'up' : 'info';
-      signals.push({ text: 'pattern_' + pm.pattern + ' (' + pm.matches + 'x)', type: pType });
-    }
-
-    /* MODULE 4: Cycles (poids 1.5) */
-    if (cy.found) {
-      var posInCycle = rev.length % cy.period;
-      var pastCat = rev.length > posInCycle ? cat(rev[posInCycle]) : cat(longAvg);
-      votes[pastCat] += 1.5 * cy.score;
-      signals.push({ text: 'cycle_p' + cy.period, type: 'info' });
-    } else {
-      votes.mid += 0.4;
-    }
-
-    /* MODULE 5: Mean Reversion (poids 2.0) */
-    if (Math.abs(mr.deviation) > 0.4) {
-      if (mr.deviation < -0.4) {
-        var rStr = Math.min(Math.abs(mr.deviation) / 2, 1);
-        votes.mid += 1.0 * rStr;
-        votes.high += 1.0 * rStr;
-        signals.push({ text: 'reversion_hausse', type: 'up' });
-      } else {
-        var rStr2 = Math.min(mr.deviation / 2, 1);
-        votes.low += 1.0 * rStr2;
-        votes.mid += 1.0 * rStr2;
-        signals.push({ text: 'reversion_baisse', type: 'down' });
-      }
-    } else {
-      votes.mid += 1.0;
-      signals.push({ text: 'equilibre', type: 'info' });
-    }
-
-    /* MODULE 6: Momentum (poids 1.5) */
-    if (mo.dir === 'up') {
-      votes.mid += 1.0;
-      votes.high += 0.5 * mo.strength;
-      signals.push({ text: 'momentum_haut', type: 'up' });
-    } else if (mo.dir === 'down') {
-      votes.low += 0.5 * mo.strength;
-      votes.mid += 1.0;
-      signals.push({ text: 'momentum_bas', type: 'down' });
-    } else {
-      votes.mid += 0.8;
-    }
-
-    /* MODULE 7: Streak (poids 1.5) */
-    if (sk.cat === 'low' && sk.len >= 4) {
-      votes.mid += 0.8;
-      votes.high += 0.7;
-      signals.push({ text: 'rupture_basse_' + sk.len, type: 'up' });
-    } else if (sk.cat === 'low' && sk.len >= 2) {
-      votes.low += 0.5;
-      votes.mid += 1.0;
-      signals.push({ text: 'serie_basse_' + sk.len, type: 'down' });
-    } else if (sk.cat === 'mid' && sk.len >= 3) {
-      votes.mid += 0.8;
-      votes.low += 0.3;
-      votes.high += 0.4;
-      signals.push({ text: 'stabilite_' + sk.len, type: 'info' });
-    } else if (sk.cat === 'high' && sk.len >= 2) {
-      votes.low += 0.8;
-      votes.mid += 0.7;
-      signals.push({ text: 'correction_haute', type: 'down' });
-    } else {
-      votes.mid += 0.8;
-    }
-
-    /* MODULE 8: Volatilite (poids 1.0) */
-    if (vl > 4) {
-      votes.high += 0.6;
-      votes.low += 0.4;
-      signals.push({ text: 'volatilite_extreme', type: 'info' });
-    } else if (vl > 2) {
-      votes.high += 0.4;
-      votes.mid += 0.4;
-      votes.low += 0.2;
-      signals.push({ text: 'volatilite_haute', type: 'info' });
-    } else if (vl < 0.6 && longAvg > 1.5) {
-      votes.mid += 0.8;
-      signals.push({ text: 'volatilite_faible', type: 'info' });
-    } else {
-      votes.mid += 0.5;
-    }
-
-    /* === DETERMINER LA CATEGORIE === */
-    var totalVotes = votes.low + votes.mid + votes.high;
-    var maxVote = Math.max(votes.low, votes.mid, votes.high);
-    var chosenCat = 'mid';
-    if (votes.low === maxVote && votes.low > votes.mid * 1.05) chosenCat = 'low';
-    else if (votes.high === maxVote && votes.high > votes.mid * 1.05) chosenCat = 'high';
-
-    var agreement = totalVotes > 0 ? maxVote / totalVotes : 0.5;
-
-    /* === GENERER LA VALEUR === */
     var pred;
 
     if (chosenCat === 'low') {
-      /* Predire entre 1.10 et 1.99x base sur la moyenne */
-      pred = cl(longAvg * rr(0.35, 0.7), 1.10, 1.99);
-      /* Ajuster selon l'intensite du signal baissier */
-      if (votes.low > votes.mid * 1.3) pred = cl(pred * 0.85, 1.10, 1.99);
-    } else if (chosenCat === 'high') {
-      /* Predire 5x+ base sur la moyenne historique */
-      var highBase = Math.max(longAvg, longMed) * rr(2.0, 4.5);
-      pred = cl(highBase, 5.0, 25);
-      /* Bonus si forte agreement */
-      if (agreement > 0.42) pred = cl(pred * 1.1, 5.0, 25);
-    } else {
-      /* MID - categorie la plus frequente, centree sur la moyenne */
-      pred = cl(longAvg * rr(0.65, 1.6), 2.0, 9.99);
-      /* Ajuster finement selon momentum recent */
-      if (mo.dir === 'up' && mo.strength > 0.3) {
-        pred = cl(pred * 1.15, 2.0, 9.99);
-      } else if (mo.dir === 'down' && mo.strength > 0.3) {
-        pred = cl(pred * 0.9, 2.0, 9.99);
+      /* Cote < 2x: basee sur la moyenne des crashs bas recents */
+      pred = avgLow * rr(0.85, 1.20);
+      pred = cl(pred, 1.15, 1.98);
+    }
+    else if (chosenCat === 'mid' && forceTransition) {
+      /* Transition depuis low: 3eme prediction basse → premiere prediction mid */
+      pred = rr(2.05, 3.20);
+      pred = cl(pred, 2.01, 3.50);
+    }
+    else if (chosenCat === 'mid') {
+      /* Cote 2-9.99x: basee sur la moyenne des crashs moyens */
+      pred = avgMid * rr(0.65, 1.40);
+      pred = cl(pred, 2.0, 9.99);
+
+      /* Ajustement fin selon le momentum des 3 derniers */
+      if (n >= 3) {
+        var last3 = history.slice(-3);
+        var m3 = avg(last3);
+        if (m3 > 4) pred = cl(pred * rr(0.8, 1.1), 2.0, 9.99);
+        else if (m3 < 2) pred = cl(pred * rr(0.7, 1.05), 2.0, 7.0);
       }
     }
-
-    /* Bruit controle */
-    pred = pred * rr(0.93, 1.07);
-    pred = cl(pred, 1.10, 25);
-
-    /* === CONFIANCE DYNAMIQUE === */
-    var conf = agreement * 72;
-
-    /* Bonus volume de donnees */
-    if (n >= 30) conf += 4;
-    else if (n >= 20) conf += 3;
-    else if (n >= 10) conf += 2;
-
-    /* Bonus precision historique */
-    var acc = getAccuracy();
-    if (acc !== null) {
-      if (acc >= 55) conf += 5;
-      else if (acc >= 45) conf += 3;
-      else conf += 1;
-      signals.push({ text: 'precision_' + acc + '%', type: acc >= 45 ? 'up' : 'down' });
+    else if (chosenCat === 'high') {
+      /* Cote >= 10x: basee sur la moyenne des crashs hauts, plafonnée */
+      pred = avgHigh * rr(0.5, 1.0);
+      pred = cl(pred, 10.0, 22);
     }
 
-    /* Bonus nombre de signaux */
-    if (signals.length >= 6) conf += 2;
+    /* Bruit naturel */
+    pred = pred * rr(0.95, 1.05);
+    return cl(Math.round(pred * 100) / 100, 1.15, 25);
+  }
 
-    /* Penalite volatilite extreme */
-    if (vl > 5) conf -= 3;
+  /* === CONFIANCE === */
+  function calcConfidence(chosenCat, trend, n, isForced) {
+    var conf = 50;
 
-    conf = cl(Math.round(conf), 25, 94);
+    /* Plus on a de donnees, plus c'est fiable */
+    if (n >= 50) conf += 8;
+    else if (n >= 30) conf += 6;
+    else if (n >= 15) conf += 4;
+    else if (n >= 8) conf += 2;
+
+    /* Accord entre tendance et prediction */
+    if (chosenCat === trend.trend) {
+      conf += Math.round(trend.strength * 15);
+    } else if (isForced) {
+      conf -= 5; /* penalite si on a ete force de changer */
+    }
+
+    /* Historique de precision */
+    var acc = getAccuracy();
+    if (acc !== null) {
+      if (acc >= 60) conf += 8;
+      else if (acc >= 50) conf += 4;
+      else conf += 1;
+    }
+
+    return cl(Math.round(conf), 28, 92);
+  }
+
+  /* === PREDICTION PRINCIPALE === */
+  function predict(fullHistory) {
+    if (fullHistory.length < 3) {
+      return {
+        prediction: cl(avg(fullHistory) + rr(-.2, .2), 1.15, 4),
+        confidence: 25,
+        signals: ['donnees_insuffisantes'],
+        signalTypes: ['info'],
+        category: 'mid',
+        rounds: fullHistory.length,
+        avg: Math.round(avg(fullHistory) * 100) / 100,
+        std: 0,
+        accuracy: null
+      };
+    }
+
+    var n = fullHistory.length;
+
+    /* 1. Detecter la tendance reelle du jeu */
+    var trendInfo = detectTrend(fullHistory);
+    var gameTrend = trendInfo.trend;
+
+    /* 2. Verifier les predictions consecutives */
+    var consec = getConsecutive();
+    var isForced = false;
+    var chosenCat = gameTrend;
+
+    /* 3. Appliquer les limites de rotation */
+    if (consec.cat === 'low' && consec.count >= 3) {
+      /* Apres 3 predictions basses consecutives → transition vers mid */
+      chosenCat = 'mid';
+      isForced = true;
+    }
+    else if (consec.cat === 'mid' && consec.count >= 3) {
+      /* Apres 3 predictions moyennes consecutives → retour a low */
+      chosenCat = 'low';
+      isForced = true;
+    }
+    else if (consec.cat === 'high' && consec.count >= 2) {
+      /* Apres 2 predictions hautes consecutives → retour a mid */
+      chosenCat = 'mid';
+      isForced = true;
+    }
+
+    /* 4. Verifier que la tendance du jeu ne contredit pas trop */
+    /* Si le jeu est en tendance basse MAIS on a ete force de predire mid,
+       c'est OK (c'est la transition naturelle apres 3 lows) */
+    /* Si le jeu est en tendance haute MAIS on vient de faire 2 highs,
+       on retombe a mid - c'est la securite */
+
+    /* 5. Generer la valeur */
+    var forceTransition = (isForced && gameTrend === 'low' && chosenCat === 'mid');
+    var pred = generateValue(chosenCat, fullHistory, forceTransition);
+
+    /* 6. Calculer la confiance */
+    var conf = calcConfidence(chosenCat, trendInfo, n, isForced);
+
+    /* 7. Generer les signaux */
+    var signals = [];
+    var signalTypes = [];
+
+    signals.push('tendance_' + gameTrend);
+    signalTypes.push(gameTrend === 'low' ? 'down' : gameTrend === 'high' ? 'up' : 'info');
+
+    if (trendInfo.streakLen >= 3) {
+      signals.push('serie_' + trendInfo.streak + '_' + trendInfo.streakLen);
+      signalTypes.push(trendInfo.streak === 'low' ? 'down' : 'up');
+    }
+
+    if (isForced) {
+      signals.push('rotation_securite');
+      signalTypes.push('info');
+    }
+
+    if (forceTransition) {
+      signals.push('transition_bas_vers_mid');
+      signalTypes.push('up');
+    }
+
+    if (n >= 15) signals.push('memoire_' + n + '_tours');
+    signalTypes.push('info');
+
+    var acc = getAccuracy();
+    if (acc !== null) {
+      signals.push('precision_' + acc + '%');
+      signalTypes.push(acc >= 45 ? 'up' : 'down');
+    }
 
     return {
-      prediction: Math.round(pred * 100) / 100,
+      prediction: pred,
       confidence: conf,
-      signals: signals.map(function(s) { return s.text; }),
-      signalTypes: signals.map(function(s) { return s.type; }),
+      signals: signals,
+      signalTypes: signalTypes,
       category: chosenCat,
       rounds: n,
-      avg: Math.round(longAvg * 100) / 100,
+      avg: Math.round(avg(fullHistory) * 100) / 100,
       std: Math.round(sd(fullHistory) * 100) / 100,
       accuracy: acc
     };
